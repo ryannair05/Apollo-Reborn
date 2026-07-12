@@ -156,6 +156,14 @@ static UITableView *GetTableViewFromViewController(UIViewController *viewControl
     UIView *rootView = [viewController view];
     if (!rootView) return nil;
 
+    // PostsSearchResultsViewController is an ASDKViewController whose node IS
+    // the table node, so its root view is the ASTableView itself (confirmed by
+    // on-device diagnostics). PostsViewController et al. instead host the
+    // ASTableView as a direct subview of a plain root view.
+    if ([rootView isKindOfClass:[UITableView class]]) {
+        return (UITableView *)rootView;
+    }
+
     for (UIView *subview in [rootView subviews]) {
         if ([subview isKindOfClass:[UITableView class]]) {
             return (UITableView *)subview;
@@ -163,6 +171,35 @@ static UITableView *GetTableViewFromViewController(UIViewController *viewControl
     }
 
     return nil;
+}
+
+// Enumerate the rich media nodes (own + crosspost) of every visible cell.
+// Shared by the mute-button sync, capture, and reclaim passes below.
+static void EnumerateVisibleRichMediaNodes(UITableView *tableView, void (^block)(id richMediaNode)) {
+    for (UITableViewCell *cell in [tableView visibleCells]) {
+        SEL nodeSel = NSSelectorFromString(@"node");
+        if (![cell respondsToSelector:nodeSel]) continue;
+
+        id cellNode = ((id (*)(id, SEL))objc_msgSend)(cell, nodeSel);
+        if (!cellNode) continue;
+
+        id richMediaNode = GetIvarObjectQuiet(cellNode, "richMediaNode");
+        if (richMediaNode) block(richMediaNode);
+
+        id crosspostRichMediaNode = GetCrosspostRichMediaNodeFromOwner(cellNode);
+        if (crosspostRichMediaNode) block(crosspostRichMediaNode);
+    }
+}
+
+// Single home for the version-fragile mangled Swift class name (previously
+// resolved independently at four call sites).
+static Class MediaPageViewControllerClass(void) {
+    static Class cls = nil;
+    static dispatch_once_t onceToken;
+    dispatch_once(&onceToken, ^{
+        cls = objc_getClass("_TtC6Apollo23MediaPageViewController");
+    });
+    return cls;
 }
 
 static BOOL IsCommentsOwnerShowingSameLinkAsMediaPage(id mediaPageVC) {
@@ -217,6 +254,25 @@ static BOOL IsPlayerOnVisibleFeedCell(UIViewController *feedVC, AVPlayer *target
     return NO;
 }
 
+// YES when `layer`'s superlayer chain reaches `ancestor` — i.e. the layer is
+// visibly attached inside that layer tree.
+static BOOL LayerIsInLayerTreeOf(CALayer *layer, CALayer *ancestor) {
+    if (!layer || !ancestor) return NO;
+    for (CALayer *walk = [layer superlayer]; walk; walk = [walk superlayer]) {
+        if (walk == ancestor) return YES;
+    }
+    return NO;
+}
+
+// Move a (shared) AVPlayerLayer into a videoNode's backing layer, sized to it
+// and unhidden — the recovery step for a layer stranded by a missing reclaim.
+static void ReparentPlayerLayerIntoVideoNodeLayer(CALayer *pLayer, CALayer *vnLayer) {
+    [pLayer removeFromSuperlayer];
+    [vnLayer addSublayer:pLayer];
+    [pLayer setFrame:[vnLayer bounds]];
+    [pLayer setHidden:NO];
+}
+
 // Recursively search a view hierarchy for a subview of a given class.
 // Used to find PlayerLayerContainerView in the transition container after
 // animateTransition: (before the ivar on MediaViewerController is set).
@@ -239,27 +295,30 @@ static UIView *FindSubviewOfClass(UIView *root, Class cls) {
 //
 // For non-shareable GIFs/Streamable/etc: player is on [videoNode player]
 //   - A new AVPlayer is created via prepareToPlayAsset:withKeys: → setPlayer:.
+// The videoNode's AVPlayerLayer (nil when playback isn't running through the
+// shared-layer path). Shared by GetPlayerFromVideoNode and the search-results
+// capture/reclaim passes, which need the LAYER itself (no [videoNode player]
+// fallback — a fallback player has no layer to re-parent).
+static AVPlayerLayer *GetPlayerLayerFromVideoNode(id videoNode) {
+    if (!videoNode) return nil;
+    SEL playerLayerSel = NSSelectorFromString(@"playerLayer");
+    if (![videoNode respondsToSelector:playerLayerSel]) return nil;
+    CALayer *layer = ((CALayer *(*)(id, SEL))objc_msgSend)(videoNode, playerLayerSel);
+    return [layer isKindOfClass:[AVPlayerLayer class]] ? (AVPlayerLayer *)layer : nil;
+}
+
 static AVPlayer *GetPlayerFromVideoNode(id videoNode) {
     if (!videoNode) return nil;
 
     // Primary path: shareable videos — player is on the AVPlayerLayer.
     // This mirrors the native code: [r21 playerLayer] → [playerLayer player]
-    SEL playerLayerSel = NSSelectorFromString(@"playerLayer");
-    if ([videoNode respondsToSelector:playerLayerSel]) {
-        id layer = ((id (*)(id, SEL))objc_msgSend)(videoNode, playerLayerSel);
-        if (layer) {
-            SEL layerPlayerSel = NSSelectorFromString(@"player");
-            if ([layer respondsToSelector:layerPlayerSel]) {
-                AVPlayer *player = ((id (*)(id, SEL))objc_msgSend)(layer, layerPlayerSel);
-                if (player) return player;
-            }
-        }
-    }
+    AVPlayer *player = [GetPlayerLayerFromVideoNode(videoNode) player];
+    if (player) return player;
 
     // Fallback: non-shareable videos — player is directly on videoNode
     SEL playerSel = NSSelectorFromString(@"player");
     if ([videoNode respondsToSelector:playerSel]) {
-        AVPlayer *player = ((id (*)(id, SEL))objc_msgSend)(videoNode, playerSel);
+        player = ((id (*)(id, SEL))objc_msgSend)(videoNode, playerSel);
         if (player) return player;
     }
 
@@ -890,11 +949,8 @@ static void HandleCommentsRichMediaVisibilityEvent(id visibilityOwner,
     id toVC = ((id (*)(id, SEL, id))objc_msgSend)(
         transitionContext, vcForKeySel, UITransitionContextToViewControllerKey);
 
-    static Class sMediaPageVCClass = nil;
-    if (!sMediaPageVCClass) {
-        sMediaPageVCClass = objc_getClass("_TtC6Apollo23MediaPageViewController");
-    }
-    if (!toVC || !sMediaPageVCClass || ![toVC isKindOfClass:sMediaPageVCClass]) return;
+    Class mediaPageVCClass = MediaPageViewControllerClass();
+    if (!toVC || !mediaPageVCClass || ![toVC isKindOfClass:mediaPageVCClass]) return;
 
     // After %orig, the transition has created a PlayerLayerContainerView for
     // shareable videos and added it to the view hierarchy with its playerLayer
@@ -1262,12 +1318,7 @@ void ApolloVideoUnmute_FixDisconnectedPlayerLayer(id postsViewController) {
                 ? [(AVPlayerLayer *)pLayer player] : nil;
             if (!player || [player rate] == 0.0f) continue;
 
-            BOOL inTree = NO;
-            CALayer *walk = [pLayer superlayer];
-            while (walk) {
-                if (walk == vnLayer) { inTree = YES; break; }
-                walk = [walk superlayer];
-            }
+            BOOL inTree = LayerIsInLayerTreeOf(pLayer, vnLayer);
 
             if (!inTree) {
                 ApolloLog(@"[VideoUnmute] FixDisconnectedPlayerLayer: re-parenting playerLayer %p to videoNode %p",
@@ -1324,6 +1375,432 @@ BOOL ApolloVideoUnmute_IsNavigatingBack(void) {
 }
 
 // =============================================================================
+// MARK: - PostsSearchResultsViewController playerLayer reclaim (native bug fix)
+// =============================================================================
+//
+// Frozen/grey inline videos after returning to search results (comments pop
+// or fullscreen dismiss). Root cause (confirmed in Hopper + on-device
+// diagnostics): Apollo's shared-playerLayer reclaim (sub_100561a40, a
+// PostSectionController method) is invoked from BOTH viewWillAppear: and
+// viewDidAppear: of PostsViewController, SavedPostsCommentsViewController and
+// ProfileViewController — but PostsSearchResultsViewController overrides
+// NEITHER lifecycle method, so a playerLayer stolen by the comments header or
+// the fullscreen PlayerLayerContainerView is never returned to the search
+// cell. The cell keeps showing its poster (frozen) or an empty container
+// (grey) while the shared AVPlayer keeps running in a detached layer tree.
+//
+// The native reclaim is Swift-only (no selector), so we replicate it here:
+// the search cell's videoNode still references the stolen AVPlayerLayer via
+// [videoNode playerLayer] (verified on device), which lets us re-parent it
+// into the videoNode's own backing layer — the same recovery strategy as
+// ApolloVideoUnmute_FixDisconnectedPlayerLayer below. Differences from the
+// native reclaim: we skip VideoSharingManager bookkeeping (not reachable from
+// ObjC; stale sharing state is harmless — the next share simply re-registers)
+// and we parent into the videoNode's layer instead of the orphanable
+// playerLayerSuperlayer container.
+//
+// Invocation mirrors Apollo's own timing (viewWillAppear body sub_100599d4c,
+// viewDidAppear body sub_100599fe4 — note their gates are OPPOSITE):
+//   - viewWillAppear: non-interactive comments pop (instant restore, like the
+//     native feed). Skipped while nav.presentedViewController != nil — the
+//     native viewWillAppear loop reclaims only with nothing presented,
+//     because during a fullscreen dismissal the layer is still animating in
+//     the transition container.
+//   - Interactive pop: deferred to the gesture-commit callback, mirroring
+//     ApolloVideoSwipeFix — reclaiming at viewWillAppear would steal the
+//     layer from the comments header on a gesture that later cancels.
+//   - viewDidAppear: fullscreen dismissal completion. The native loop here
+//     reclaims only when presentedViewController is STILL the dismissing
+//     MediaPageViewController (UIKit tears the presentation down after the
+//     presenter's viewDidAppear, so it is never nil on this path).
+// =============================================================================
+
+// Last-known playback refs per RichMediaNode, saved whenever a pass (or the
+// viewWillDisappear capture) sees the cell with a live playerLayer + player.
+// Needed because a fullscreen entry that takes the NON-shared path tears down
+// the videoNode's own playerLayer/player references while the search view is
+// out of the window — at dismissal there is nothing left on the node to
+// reclaim (observed on device: playerLayer=0x0 player=0x0 on a cell that was
+// rate=1.00 inTree=1 seconds earlier).
+static const void *kSearchSavedPlayerLayerKey = &kSearchSavedPlayerLayerKey;
+static const void *kSearchSavedPlayerKey = &kSearchSavedPlayerKey;
+// NSNumber(BOOL): whether this cell's video was PLAYING when the search VC
+// last left the window (captured in viewWillDisappear). Gates the resume
+// below — Apollo autoplays only the one video at the table midpoint, so
+// blanket-resuming every paused visible video creates stray concurrent
+// players that Apollo's midpoint play/pause bookkeeping doesn't know about
+// (observed on device: two cells at rate=1.00 simultaneously, followed by
+// unreliable autoplay while scrolling). The flag is transition-scoped: the
+// trailing re-check pass clears it so a later pass can never resume a video
+// Apollo has since paused off stale data.
+static const void *kSearchWasPlayingKey = &kSearchWasPlayingKey;
+// Marker association on the AVPLAYER itself: set when another module reports
+// the player was deliberately stopped (e.g. the user closed the floating PiP
+// card, whose teardown applies Apollo's scrolled-away pause+mute state). The
+// resume gates below must never restart such a player. The mark lifts as
+// soon as a pass observes the player playing again (someone legitimately
+// restarted it).
+static const void *kSearchDeliberatelyStoppedKey = &kSearchDeliberatelyStoppedKey;
+
+static BOOL PlayerWasDeliberatelyStopped(AVPlayer *player) {
+    return player && objc_getAssociatedObject(player, kSearchDeliberatelyStoppedKey) != nil;
+}
+
+static void ClearDeliberatelyStoppedMarkIfPlaying(AVPlayer *player) {
+    if (player && [player rate] != 0.0f
+        && objc_getAssociatedObject(player, kSearchDeliberatelyStoppedKey)) {
+        objc_setAssociatedObject(player, kSearchDeliberatelyStoppedKey, nil,
+                                 OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    }
+}
+
+// Exported for ApolloPictureInPicture.xm: called when a PiP teardown pauses
+// the player on purpose, so the search reclaim never resurrects it.
+void ApolloVideoUnmute_NotePlayerDeliberatelyStopped(AVPlayer *player) {
+    if (!player) return;
+    ApolloLog(@"[VideoUnmute] SearchReclaim: player %p marked deliberately stopped", player);
+    objc_setAssociatedObject(player, kSearchDeliberatelyStoppedKey, @YES,
+                             OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+}
+
+static void ClearSearchSavedRefs(id richMediaNode) {
+    objc_setAssociatedObject(richMediaNode, kSearchSavedPlayerLayerKey, nil,
+                             OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    objc_setAssociatedObject(richMediaNode, kSearchSavedPlayerKey, nil,
+                             OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+}
+
+// After a resume that leaves the video audible, give the inline system-PiP
+// controller its arming chance — no scroll/visibility event fires for a
+// programmatic resume, mirroring the other deliberate resume paths in this
+// file. Muted players must NOT arm (the feed arm path is unmuted-only by
+// design and ApolloPiP_NoteInlineVideoAudible itself doesn't check muted).
+static void NoteSearchResumeMaybeAudible(id videoNode, AVPlayer *player) {
+    if (player && ![player isMuted]) {
+        ApolloPiP_NoteInlineVideoAudible(videoNode, player);
+    }
+}
+
+// Returns YES when the cell hosts a video node at all (drives whether a
+// trailing re-check pass is worth scheduling).
+static BOOL FixupSearchCellRichMediaNode(id richMediaNode, NSString *reason) {
+    id videoNode = GetVideoNodeFromRichMediaNode(richMediaNode);
+    if (!videoNode) return NO;
+
+    AVPlayerLayer *pLayer = GetPlayerLayerFromVideoNode(videoNode);
+    AVPlayer *player = [pLayer player];
+
+    CALayer *vnLayer = ((CALayer *(*)(id, SEL))objc_msgSend)(videoNode, @selector(layer));
+    if (!vnLayer) return YES;
+
+    NSNumber *wasPlaying = objc_getAssociatedObject(richMediaNode, kSearchWasPlayingKey);
+
+    if (!pLayer || !player) {
+        // The node's own refs are gone (teardown while offscreen). Restore
+        // from the refs we saved while the video was last visibly attached.
+        CALayer *savedLayer = objc_getAssociatedObject(richMediaNode, kSearchSavedPlayerLayerKey);
+        AVPlayer *savedPlayer = objc_getAssociatedObject(richMediaNode, kSearchSavedPlayerKey);
+        if (!savedLayer || !savedPlayer || ApolloPiP_IsOwnedPlayer(savedPlayer)) {
+            ApolloLog(@"[VideoUnmute] SearchReclaim(%@): videoNode=%p has playerLayer=%p player=%p, no saved refs — skipping",
+                      reason, videoNode, pLayer, player);
+            return YES;
+        }
+        if (![savedPlayer currentItem]) {
+            // Dead playback pipeline — re-parenting its layer would draw a
+            // black rectangle over the poster. Drop the refs for good.
+            ApolloLog(@"[VideoUnmute] SearchReclaim(%@): videoNode=%p saved player %p has no item — clearing dead refs",
+                      reason, videoNode, savedPlayer);
+            ClearSearchSavedRefs(richMediaNode);
+            return YES;
+        }
+
+        BOOL savedInTree = LayerIsInLayerTreeOf(savedLayer, vnLayer);
+
+        ApolloLog(@"[VideoUnmute] SearchReclaim(%@): videoNode=%p refs torn down — restoring saved layer=%p player=%p (rate=%.2f wasPlaying=%@ inTree=%d)",
+                  reason, videoNode, savedLayer, savedPlayer,
+                  [savedPlayer rate], wasPlaying, savedInTree);
+
+        if (!savedInTree) {
+            ReparentPlayerLayerIntoVideoNodeLayer(savedLayer, vnLayer);
+        }
+
+        // Same resume gate as the normal path: only a video that was playing
+        // at the last viewWillDisappear capture may come back playing —
+        // teardown is not proof this cell was the transitioned video (all
+        // offscreen cells can be torn down), and a player the user stopped
+        // via PiP close must stay stopped.
+        if ([savedPlayer rate] == 0.0f && [wasPlaying boolValue]
+            && !PlayerWasDeliberatelyStopped(savedPlayer)) {
+            ApolloLog(@"[VideoUnmute] SearchReclaim(%@): resuming restored player", reason);
+            [savedPlayer play];
+            // Keep the flag truthful for the trailing re-check of this same
+            // transition (the mute dance may re-pause it once more; the node
+            // re-adopts the grafted layer synchronously — the ASDK fork's
+            // playerLayer getter scans sublayers — so that pass takes the
+            // normal path).
+            objc_setAssociatedObject(richMediaNode, kSearchWasPlayingKey, @YES,
+                                     OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+            NoteSearchResumeMaybeAudible(videoNode, savedPlayer);
+        }
+
+        // One-shot: the refs are consumed. The synchronous re-adoption above
+        // means the next capture re-saves fresh refs from the node itself;
+        // keeping consumed refs would let a much later pass resurrect a
+        // player Apollo has long since released.
+        ClearSearchSavedRefs(richMediaNode);
+        return YES;
+    }
+
+    ClearDeliberatelyStoppedMarkIfPlaying(player);
+
+    // A PiP-owned player intentionally lives off-cell in the floating card —
+    // reclaiming it would rip the video out of the card.
+    if (ApolloPiP_IsOwnedPlayer(player)) return YES;
+
+    BOOL inTree = LayerIsInLayerTreeOf(pLayer, vnLayer);
+
+    BOOL shareable = NO;
+    SEL shareableSel = NSSelectorFromString(@"allowPlayerLayerToBeShareable");
+    if ([videoNode respondsToSelector:shareableSel]) {
+        shareable = ((BOOL (*)(id, SEL))objc_msgSend)(videoNode, shareableSel);
+    }
+
+    ApolloLog(@"[VideoUnmute] SearchReclaim(%@): videoNode=%p player=%p rate=%.2f muted=%d inTree=%d shareable=%d",
+              reason, videoNode, player, [player rate], [player isMuted], inTree, shareable);
+
+    BOOL didReparent = !inTree;
+    if (!inTree) {
+        ReparentPlayerLayerIntoVideoNodeLayer(pLayer, vnLayer);
+
+        SyncMuteButtonIcon(richMediaNode, [player isMuted]);
+
+        // NOTE: the native reclaim also calls setAllowPlayerLayerToBeShareable:NO
+        // here, but it does so hand-in-hand with clearing the VideoSharingManager
+        // registration (Swift-only, unreachable for us). Setting the flag alone
+        // creates a hybrid state Apollo never produces: the next fullscreen tap
+        // takes the non-shared path and tears down the inline player entirely
+        // (the frozen "playerLayer=0x0" cycles observed on device). Leaving the
+        // flag as-is keeps the node in the same "sharing active" state it has
+        // during normal inline playback, which the share setup handles fine on
+        // re-entry. Cost: the native unpause handler keeps skipping this node
+        // after mute dances — covered by the resume below + post-dance pass.
+    }
+
+    // Transitions away from this cell force-pause the player (the mute
+    // dance's T+0 pause fires async from MediaPageVC.viewDidDisappear /
+    // TouchHintVideoNode.didExitVisibleState) and its T+100ms unpause skips
+    // shareable nodes. Resume a paused player ONLY when this cell was the
+    // one involved in the transition (its layer needed re-parenting) or it
+    // was playing when the search VC left the window (viewWillDisappear
+    // capture) — and never one the user deliberately stopped. A video Apollo
+    // paused because it is not at the table midpoint must STAY paused —
+    // force-playing it leaves a stray player that breaks Apollo's
+    // one-at-a-time autoplay bookkeeping while scrolling.
+    if ([player rate] == 0.0f) {
+        if ((didReparent || [wasPlaying boolValue]) && !PlayerWasDeliberatelyStopped(player)) {
+            ApolloLog(@"[VideoUnmute] SearchReclaim(%@): resuming force-paused player (didReparent=%d wasPlaying=%@)",
+                      reason, didReparent, wasPlaying);
+            [player play];
+            // Keep the flag truthful for the trailing re-check of this
+            // same transition (the dance may re-pause it once more).
+            objc_setAssociatedObject(richMediaNode, kSearchWasPlayingKey, @YES,
+                                     OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+            NoteSearchResumeMaybeAudible(videoNode, player);
+        } else {
+            ApolloLog(@"[VideoUnmute] SearchReclaim(%@): leaving paused player alone (wasPlaying=%@ stopped=%d)",
+                      reason, wasPlaying, PlayerWasDeliberatelyStopped(player));
+        }
+    }
+    return YES;
+}
+
+// Save the playback refs of every visible video cell. Runs when the search VC
+// is about to leave the window (fullscreen presentation / comments push) — the
+// SINGLE writer of the saved refs and the wasPlaying flag, and it always runs
+// before any offscreen teardown can occur.
+static void CaptureSearchResultsPlayerRefs(UIViewController *searchVC) {
+    UITableView *tableView = GetTableViewFromViewController(searchVC);
+    if (!tableView) return;
+
+    EnumerateVisibleRichMediaNodes(tableView, ^(id richMediaNode) {
+        id videoNode = GetVideoNodeFromRichMediaNode(richMediaNode);
+        if (!videoNode) return;
+
+        AVPlayerLayer *pLayer = GetPlayerLayerFromVideoNode(videoNode);
+        AVPlayer *player = [pLayer player];
+        if (!pLayer || !player) return;
+
+        // A PiP-owned player lives in the floating card; its lifecycle is the
+        // card's business — never capture it for a later restore.
+        if (ApolloPiP_IsOwnedPlayer(player)) return;
+
+        ClearDeliberatelyStoppedMarkIfPlaying(player);
+
+        objc_setAssociatedObject(richMediaNode, kSearchSavedPlayerLayerKey, pLayer,
+                                 OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+        objc_setAssociatedObject(richMediaNode, kSearchSavedPlayerKey, player,
+                                 OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+        // Pre-transition truth for the resume gating: only a video that was
+        // playing when the view left the window may be force-resumed by the
+        // fixup passes.
+        BOOL isPlaying = [player rate] != 0.0f;
+        objc_setAssociatedObject(richMediaNode, kSearchWasPlayingKey, @(isPlaying),
+                                 OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+        ApolloLog(@"[VideoUnmute] SearchReclaim(capture): saved layer=%p player=%p playing=%d for videoNode=%p",
+                  pLayer, player, isPlaying, videoNode);
+    });
+}
+
+// One pass over the visible cells. Returns YES when any cell hosts a video
+// node (i.e. a trailing re-check could have something to do).
+static BOOL ReclaimSearchResultsPlayerLayersOnce(UIViewController *searchVC, NSString *reason) {
+    UITableView *tableView = GetTableViewFromViewController(searchVC);
+    if (!tableView) {
+        ApolloLog(@"[VideoUnmute] SearchReclaim(%@): no tableView found on %@", reason, [searchVC class]);
+        return NO;
+    }
+
+    // Without disabling actions, Core Animation would interpolate the
+    // re-parent + frame change mid-transition (visible "zoom" artifact —
+    // same reason ApolloVideoSwipeFix wraps its deferred reclaim).
+    [CATransaction begin];
+    [CATransaction setDisableActions:YES];
+
+    __block BOOL sawVideoCell = NO;
+    EnumerateVisibleRichMediaNodes(tableView, ^(id richMediaNode) {
+        if (FixupSearchCellRichMediaNode(richMediaNode, reason)) {
+            sawVideoCell = YES;
+        }
+    });
+
+    [CATransaction commit];
+    return sawVideoCell;
+}
+
+// Pending trailing re-check bookkeeping: a newer scheduled re-check
+// supersedes any older pending one, so the two lifecycle callbacks of a
+// single pop produce ONE trailing pass, anchored at the later (safer) time.
+static NSUInteger sSearchReclaimRecheckGeneration = 0;
+
+static void ClearSearchWasPlayingFlags(UIViewController *searchVC) {
+    UITableView *tableView = GetTableViewFromViewController(searchVC);
+    if (!tableView) return;
+    EnumerateVisibleRichMediaNodes(tableView, ^(id richMediaNode) {
+        objc_setAssociatedObject(richMediaNode, kSearchWasPlayingKey, nil,
+                                 OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    });
+}
+
+// The mute dance triggered by the same transition runs asynchronously
+// (T+0 pauseAll ... T+100ms unpauseAll after MediaPageVC.viewDidDisappear or
+// the comments header's didExitVisibleState, the latter firing near POP
+// COMPLETION — up to ~350ms after viewWillAppear). Its pause can land after
+// an immediate pass, re-freezing the video it just resumed (observed on
+// device). One re-check after the dance window has fully settled fixes the
+// race; it is idempotent when nothing changed.
+static void ScheduleSearchReclaimRecheck(UIViewController *searchVC, NSString *reason) {
+    NSUInteger generation = ++sSearchReclaimRecheckGeneration;
+    __weak UIViewController *weakVC = searchVC;
+    NSString *recheckReason = [reason stringByAppendingString:@" post-dance"];
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.35 * NSEC_PER_SEC)),
+                   dispatch_get_main_queue(), ^{
+        if (generation != sSearchReclaimRecheckGeneration) return;  // superseded
+        UIViewController *strongVC = weakVC;
+        if (!strongVC || ![[strongVC viewIfLoaded] window]) return;
+        ReclaimSearchResultsPlayerLayersOnce(strongVC, recheckReason);
+        // The transition is over: drop the pre-transition wasPlaying flags so
+        // no later pass can resume a video Apollo has since paused (e.g. the
+        // user scrolled and the midpoint moved) off stale data.
+        ClearSearchWasPlayingFlags(strongVC);
+    });
+}
+
+static void ReclaimSearchResultsPlayerLayers(UIViewController *searchVC, NSString *reason) {
+    if (ReclaimSearchResultsPlayerLayersOnce(searchVC, reason)) {
+        ScheduleSearchReclaimRecheck(searchVC, reason);
+    }
+}
+
+// PostsSearchResultsViewController implements neither viewWillAppear: nor
+// viewDidAppear: (that is the bug) — these hooks land on the class itself and
+// %orig dispatches to the inherited superclass implementation.
+%group SearchResultsReclaim
+
+%hook PostsSearchResultsViewController
+
+- (void)viewWillDisappear:(BOOL)animated {
+    %orig;
+    // The view is about to leave the window (comments push or fullscreen
+    // presentation). Snapshot playback refs now: a non-shared fullscreen
+    // entry tears down the videoNode's playerLayer/player while offscreen,
+    // and the restore path needs the refs from before that happens.
+    CaptureSearchResultsPlayerRefs((UIViewController *)self);
+}
+
+- (void)viewWillAppear:(BOOL)animated {
+    %orig;
+
+    UINavigationController *nav = [(UIViewController *)self navigationController];
+    id<UIViewControllerTransitionCoordinator> coordinator = nav ? [nav transitionCoordinator] : nil;
+
+    // Interactive pop in progress: defer to the commit callback. Reclaiming
+    // now would steal the layer from the still-visible comments header, and a
+    // cancelled gesture would leave IT grey (the bug ApolloVideoSwipeFix
+    // exists to prevent on the main feed). No from-VC class check needed —
+    // the reclaim is a no-op unless a visible cell has a disconnected layer.
+    if (coordinator && [coordinator isInteractive]) {
+        __weak UIViewController *weakSelf = (UIViewController *)self;
+        [coordinator notifyWhenInteractionChangesUsingBlock:
+            ^(id<UIViewControllerTransitionCoordinatorContext> context) {
+                if ([context isCancelled]) return;
+                UIViewController *strongSelf = weakSelf;
+                if (!strongSelf) return;
+                ReclaimSearchResultsPlayerLayers(strongSelf, @"interactive pop commit");
+            }];
+        return;
+    }
+
+    // Mid-fullscreen-dismissal (presentedViewController still set): the layer
+    // is animating in the transition container — viewDidAppear handles it.
+    // Same gate the native reclaim loop applies per section controller.
+    if ([nav presentedViewController]) return;
+
+    ReclaimSearchResultsPlayerLayers((UIViewController *)self, @"viewWillAppear");
+}
+
+- (void)viewDidAppear:(BOOL)animated {
+    %orig;
+
+    // Apollo's own viewDidAppear reclaim body (sub_100599fe4) runs the
+    // reclaim precisely when presentedViewController is STILL the dismissing
+    // MediaPageViewController: UIKit keeps the presentation registered until
+    // after the presenter's viewDidAppear, so during a fullscreen dismissal
+    // this is the only appearance callback where the layer is free to take
+    // back. Any other modal (e.g. a share sheet) means no dismissal of the
+    // media viewer is happening — leave the layer alone.
+    UINavigationController *nav = [(UIViewController *)self navigationController];
+    UIViewController *presented = [nav presentedViewController];
+    if (presented) {
+        Class mediaPageVCClass = MediaPageViewControllerClass();
+        if (!mediaPageVCClass || ![presented isKindOfClass:mediaPageVCClass]) return;
+        ReclaimSearchResultsPlayerLayers((UIViewController *)self, @"fullscreen dismissal");
+        return;
+    }
+
+    // Plain pop: viewWillAppear (or the interactive-commit callback) already
+    // ran the immediate pass. Only (re)schedule the trailing re-check — its
+    // completion-anchored timing is the one that reliably outlasts a mute
+    // dance triggered at pop completion (didExitVisibleState), and the
+    // generation counter supersedes the earlier-scheduled one so a pop ends
+    // with a single trailing pass.
+    ScheduleSearchReclaimRecheck((UIViewController *)self, @"viewDidAppear");
+}
+
+%end
+
+%end
+
+// =============================================================================
 // MARK: - Constructor
 // =============================================================================
 
@@ -1331,7 +1808,7 @@ BOOL ApolloVideoUnmute_IsNavigatingBack(void) {
     Class richMediaHeaderCellClass = objc_getClass("_TtC6Apollo23RichMediaHeaderCellNode");
     Class commentsHeaderCellClass = objc_getClass("_TtC6Apollo22CommentsHeaderCellNode");
     Class richMediaNodeClass = objc_getClass("_TtC6Apollo13RichMediaNode");
-    Class mediaPageVCClass = objc_getClass("_TtC6Apollo23MediaPageViewController");
+    Class mediaPageVCClass = MediaPageViewControllerClass();
     Class mediaViewerAnimClass = objc_getClass("_TtC6Apollo30MediaViewerAnimationController");
 
     ApolloLog(@"[VideoUnmute] ctor: RichMediaHeaderCellNode=%p, CommentsHeaderCellNode=%p, RichMediaNode=%p, MediaPageVC=%p, MediaViewerAnimCtrl=%p",
@@ -1351,6 +1828,12 @@ BOOL ApolloVideoUnmute_IsNavigatingBack(void) {
         MediaPageViewController = mediaPageVCClass,
         MediaViewerAnimationController = mediaViewerAnimClass
     );
+
+    Class searchResultsVCClass = objc_getClass("_TtC6Apollo32PostsSearchResultsViewController");
+    if (searchResultsVCClass) {
+        %init(SearchResultsReclaim, PostsSearchResultsViewController = searchResultsVCClass);
+        ApolloLog(@"[VideoUnmute] ctor: search results playerLayer reclaim installed");
+    }
 
     ApolloLog(@"[VideoUnmute] ctor: hooks initialized");
 }
